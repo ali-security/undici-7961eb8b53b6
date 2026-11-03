@@ -39,9 +39,10 @@ jobs:
       - name: Install dependencies
         run: npm install
 
-      - name: Print installed dependencies
-        run: npm ls --all
-        continue-on-error: true
+      # SEAL: the "Print installed dependencies" (`npm ls --all`) step is dropped —
+      # a pure diagnostic that masked its own failure with `continue-on-error`, which
+      # the sealed build harness rejects. This file is now dead anyway: its steps are
+      # inlined into nodejs.yml's `test` job (a `uses:` job cannot set timeout-minutes).
 
       - name: Run tests with coverage
         id: coverage

@@ -1,21 +1,30 @@
 name: Node CI
 
 on:
-  push:
-    branches:
-     - main
-     - current
-     - next
-     - 'v*'
-  pull_request:
+  # SEAL: dispatch-only — the upstream push/pull_request triggers fire unbidden the
+  # moment the build fork syncs and burn a full 12-leg matrix per push.
+  workflow_dispatch:
+    inputs:
+      # SEAL: added — lets a dispatch scope the test run to the files relevant to a
+      # patch instead of the whole `npm run test:javascript` chain. The value is a
+      # single borp glob, so name several files with one brace-glob, e.g.
+      # "test/{retry-handler,interceptors/retry}.js". Empty runs the full suite.
+      test-filter:
+        description: 'borp glob scoping the test run; empty runs the full suite'
+        required: false
+        default: ''
+        type: string
 
 permissions:
   contents: read
 
 jobs:
   dependency-review:
-    if: ${{ github.event_name == 'pull_request' }}
+    # SEAL: disabled — pull_request-event only and needs the dependency-review API,
+    # neither of which is available for a workflow_dispatch run on the fork.
+    if: false
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - name: Harden Runner
         uses: step-security/harden-runner@f086349bfa2bd1361f7909c78558e816508cdc10 # v2.8.0
@@ -32,7 +41,13 @@ jobs:
 
   lint:
     name: Lint
+    # SEAL: disabled — `standard` reports "Block must not be padded by blank lines
+    # (padded-blocks)" in lib/dispatcher/agent.js on PRISTINE source. That blank line
+    # is present in the published npm tarball, so fixing it would break byte parity.
+    # Lint is a style gate that executes no package code, so no test coverage is lost.
+    if: false
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - name: Checkout
         uses: actions/checkout@9bb56186c3b09b4f86b1c65136769dd318469633 # v4.1.2
@@ -51,6 +66,11 @@ jobs:
         run: npm run lint
 
   test:
+    # SEAL: inlined verbatim from the reusable .github/workflows/test.yml, because a
+    # `uses:` (reusable-workflow call) job cannot declare `timeout-minutes`, which the
+    # sealed build harness requires on every job. Matrix, steps and test commands are
+    # unchanged; `inputs.*` became `matrix.*`.
+    name: Test with Node.js ${{ matrix.node-version }} on ${{ matrix.runs-on }}
     strategy:
       fail-fast: false
       max-parallel: 0
@@ -64,14 +84,81 @@ jobs:
           - ubuntu-latest
           - windows-latest
           - macos-latest
-    uses: ./.github/workflows/test.yml
-    with:
-      node-version: ${{ matrix.node-version }}
-      runs-on: ${{ matrix.runs-on }}
-    secrets: inherit
+    timeout-minutes: 45
+    runs-on: ${{ matrix.runs-on }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9bb56186c3b09b4f86b1c65136769dd318469633 # v4.1.2
+        with:
+          persist-credentials: false
+
+      - name: Setup Node.js@${{ matrix.node-version }}
+        uses: actions/setup-node@60edb5dd545a775178f52524783378180af0d1f8 # v4.0.2
+        with:
+          node-version: ${{ matrix.node-version }}
+
+      - name: Print version information
+        run: |
+          echo OS: $(node -p "os.version()")
+          echo Node.js: $(node --version)
+          echo npm: $(npm --version)
+          echo git: $(git --version)
+
+      - name: Install dependencies
+        run: npm install
+
+      # SEAL: the upstream "Print installed dependencies" (`npm ls --all`) step is
+      # dropped — it is a pure diagnostic and it masked its own failures, which the
+      # sealed build harness rejects. Removing it runs no fewer tests.
+      # SEAL: the upstream "Run tests with coverage" (npm run coverage:ci) and
+      # "Coverage Report" (codecov) steps are dropped — codecov needs
+      # secrets.CODECOV_TOKEN, which is not available on the fork. The plain
+      # "Run tests" step below now runs on every matrix leg (its
+      # `if: steps.coverage.outcome == 'skipped'` condition is removed with the
+      # coverage step), so no test is lost.
+      - name: Run tests
+        if: ${{ inputs.test-filter == '' }}
+        run: npm run test:javascript
+        env:
+          CI: true
+
+      - name: Report skipped tests and their reasons
+        if: ${{ inputs.test-filter == '' }}
+        run: node .github/scripts/report-skips.mjs
+
+      # SEAL: added — scoped counterpart of the step above, used when a dispatch
+      # supplies `test-filter`. It runs the same runner (borp) the npm test scripts
+      # use, so a failing test still fails the job; nothing is masked. Each comma- or
+      # space-separated entry becomes its own `borp -p` run, and an entry matching no
+      # file fails the step rather than reporting a silent "0 tests" pass.
+      - name: Run scoped tests
+        if: ${{ inputs.test-filter != '' }}
+        shell: bash
+        run: |
+          node scripts/generate-pem
+          status=0
+          IFS=', ' read -r -a patterns <<< "$TEST_FILTER"
+          for pattern in "${patterns[@]}"; do
+            [ -n "$pattern" ] || continue
+            files=( $pattern )
+            if [ ! -e "${files[0]}" ]; then
+              echo "No test file matches '$pattern'"
+              exit 1
+            fi
+            echo "--- borp -p $pattern (${files[*]})"
+            npx borp --expose-gc -p "$pattern" || status=1
+          done
+          exit $status
+        env:
+          CI: true
+          TEST_FILTER: ${{ inputs.test-filter }}
 
   test-without-intl:
     name: Test with Node.js ${{ matrix.version }} compiled --without-intl
+    # SEAL: disabled — this job compiles Node.js from source (timeout-minutes: 120),
+    # far beyond the sealed build harness per-job budget. It re-runs the same test
+    # suites against an intl-less Node, so no patched-path coverage is lost.
+    if: false
     strategy:
       fail-fast: false
       max-parallel: 0
@@ -144,6 +231,7 @@ jobs:
   test-fuzzing:
     name: Fuzzing
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - name: Checkout
         uses: actions/checkout@9bb56186c3b09b4f86b1c65136769dd318469633 # v4.1.2
@@ -182,9 +270,44 @@ jobs:
       - name: Run typings tests
         run: npm run test:typescript
 
+  # SEAL: added — upstream has no workflow that packs the release tarball, so the
+  # pack + upload steps are added here (the test workflow becomes the build workflow).
+  pack:
+    name: Pack npm tarball
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9bb56186c3b09b4f86b1c65136769dd318469633 # v4.1.2
+        with:
+          persist-credentials: false
+
+      - name: Setup Node.js
+        uses: actions/setup-node@60edb5dd545a775178f52524783378180af0d1f8 # v4.0.2
+        with:
+          node-version: 22.23.2
+
+      # SEAL: `npm install --ignore-scripts` must run before `npm pack --ignore-scripts`.
+      # Without it, pack still fires the `prepare` lifecycle and dies with
+      # `sh: 1: husky: not found` (exit 127). npm 11.20.0 is the npm that packed the
+      # public tarball.
+      - name: Pack
+        run: |
+          npm install --ignore-scripts
+          npm i -g npm@11.20.0
+          npm pack --ignore-scripts
+
+      - name: Upload tarball
+        uses: actions/upload-artifact@65462800fd760344b1a7b4382951275a0abb4808 # v4.3.3
+        with:
+          name: undici-tarball
+          path: undici-6.29.0.tgz
+          if-no-files-found: error
+
   automerge:
-    if: >
-      github.event_name == 'pull_request' && github.event.pull_request.user.login == 'dependabot[bot]'
+    # SEAL: disabled — dependabot-only job; it needs pull-request write permissions and
+    # a dependabot-authored pull_request event, neither available on the fork.
+    if: false
     needs:
       - dependency-review
       - test
@@ -193,6 +316,7 @@ jobs:
       - test-fuzzing
       - lint
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     permissions:
       contents: write
       pull-requests: write

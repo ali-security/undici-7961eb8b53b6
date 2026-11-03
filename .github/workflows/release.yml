@@ -1,11 +1,8 @@
 name: Create release
 
 on:
-  push:
-    branches:
-      - v6.x
-    paths:
-      - package.json
+  # SEAL: non-target workflow — auto-triggers removed so it cannot fire on the fork.
+  workflow_dispatch:
 
 permissions:
   contents: read

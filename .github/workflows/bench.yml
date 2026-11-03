@@ -1,7 +1,7 @@
 name: Benchmarks
 on:
-  - push
-  - pull_request
+  # SEAL: non-target workflow — auto-triggers removed so it cannot fire on the fork.
+  workflow_dispatch:
 
 permissions:
   contents: read
